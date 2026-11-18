@@ -1,0 +1,6 @@
+# Однакові правила лінтера локально і в CI
+target-version = "py312"
+line-length = 110
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP"]

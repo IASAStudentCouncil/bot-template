@@ -1,0 +1,102 @@
+# CI/CD бота: перевірка коду на кожен PR, деплой у контейнер bots на push у main,
+# сповіщення в Telegram. Повна інструкція — README.md.
+#
+# Секрети й змінні репо задає девопс одною командою (iasa-infra/scripts/connect-repo.sh <repo> bots):
+#   secrets: DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS, TG_BOT_TOKEN, TG_CHAT_ID, TG_THREAD_ID
+#   variables: DEPLOY_HOST, DEPLOY_SSH_PORT
+# Поки DEPLOY_HOST не задано, деплой пропускається (тести й сповіщення працюють).
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # як у контейнері
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: lint
+        run: ruff check .
+      - name: imports
+        # перевіряє, що всі залежності на місці і модуль імпортується (без запуску бота)
+        run: python -c "import bot"
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_HOST != ''
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Deploy to bots container
+        env:
+          HOST: ${{ vars.DEPLOY_HOST }}
+          PORT: ${{ vars.DEPLOY_SSH_PORT }}
+          APP: ${{ github.event.repository.name }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APP=$(echo "$APP" | tr '[:upper:]' '[:lower:]')
+          echo "$TOKEN" | ssh -i ~/.ssh/id_deploy -p "$PORT" \
+            -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 \
+            "deploy@$HOST" deploy-app "$APP" "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+
+  notify:
+    name: telegram
+    needs: [test, deploy]
+    if: always() && github.event_name != 'pull_request' && needs.test.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: send
+        env:
+          TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          CHAT: ${{ secrets.TG_CHAT_ID }}
+          THREAD: ${{ secrets.TG_THREAD_ID }}
+          CHECK: ${{ needs.test.result }}
+          DEPLOY: ${{ needs.deploy.result }}
+          REPO: ${{ github.event.repository.name }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          MSG: ${{ github.event.head_commit.message }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$TOKEN" ] && [ -n "$CHAT" ] || { echo "Telegram не налаштовано (TG_BOT_TOKEN / TG_CHAT_ID) — пропускаю"; exit 0; }
+          [ -n "$MSG" ] || MSG="ручний запуск"
+          esc() { sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g'; }
+          if [ "$DEPLOY" = success ]; then icon="🟩"; status="задеплоєно"
+          elif [ "$DEPLOY" = skipped ] && [ "$CHECK" = success ]; then icon="🟦"; status="перевірено, без деплою"
+          else icon="🟥"; status="впало (check: $CHECK, deploy: $DEPLOY)"; fi
+          text="$icon <b>$REPO</b> · $BRANCH — $status
+          👤 $ACTOR
+          💬 $(printf '%s' "$MSG" | head -n1 | esc)
+          🔗 <a href=\"$RUN\">run</a>"
+          text=$(printf '%s\n' "$text" | sed 's/^ *//')
+          args=()
+          [ -n "$THREAD" ] && args+=(-d message_thread_id="$THREAD")
+          resp=$(curl -sS -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+            -d chat_id="$CHAT" -d parse_mode=HTML -d disable_web_page_preview=true \
+            "${args[@]}" --data-urlencode text="$text") || resp="curl failed"
+          if echo "$resp" | grep -q '"ok":true'; then echo "telegram: надіслано"; else echo "::warning::Telegram: $resp"; fi
